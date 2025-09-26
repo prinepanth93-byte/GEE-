@@ -1,0 +1,332 @@
+// 1. 定义研究区域：宁夏回族自治区边界
+//var ningxiaBounds = ee.Geometry.Rectangle([104.0, 35.0, 107.0, 39.0]);
+//Map.centerObject(ningxiaBounds, 7);
+//Map.addLayer(ningxiaBounds, {color: 'red'}, '宁夏边界');
+//裁剪省界
+var ningxiaBounds=ee.FeatureCollection("projects/ace-computer-472400-a2/assets/nningxialine");
+Map.centerObject(ningxiaBounds,7);
+Map.addLayer(ningxiaBounds,{'color':'yellow'},'研究区');
+
+// 2. 加载MODIS数据
+//加载MODIS NDVI数据 (2001-2020)
+var modisNDVI = ee.ImageCollection('MODIS/006/MOD13A1')
+  .filterDate('2001-01-01', '2020-12-31')
+  .filterBounds(ningxiaBounds)
+  .select('NDVI');  // NDVI值范围是-2000到10000
+//加载EVI数据
+var modisEVI = ee.ImageCollection('MODIS/006/MOD13A1')
+  .filterDate('2001-01-01', '2020-12-31')
+  .filterBounds(ningxiaBounds)
+  .select('EVI');
+
+// EVI标准化
+var scaleEVI = function(image) {
+  return image.multiply(0.0001).copyProperties(image, ['system:time_start']);
+};
+
+var modisEVIscaled = modisEVI.map(scaleEVI);
+
+//加载MODIS反射率数据（用于湿度指数计算）
+var modisReflectance = ee.ImageCollection('MODIS/006/MOD09A1')
+  .filterDate('2001-01-01', '2020-12-31')
+  .filterBounds(ningxiaBounds);
+
+// 3. 数据预处理：将NDVI值转换为标准单位（-1到1）
+var scaleNDVI = function(image) {
+  return image.divide(10000)
+    .copyProperties(image, ['system:time_start']);
+};
+var modisNDVIscaled = modisNDVI.map(scaleNDVI);
+
+// 4. 计算每年的最大NDVI合成（消除云等影响）
+var years = ee.List.sequence(2001, 2020);
+var annualMaxNDVI = years.map(function(year) {
+  var startDate = ee.Date.fromYMD(year, 1, 1);
+  var endDate = ee.Date.fromYMD(year, 12, 31);
+
+  return modisNDVIscaled
+    .filterDate(startDate, endDate)
+    .max()
+    .set('year', year)
+    .set('system:time_start', startDate.millis()) // 新增时间属性，用于趋势计算
+    .rename('max_ndvi');
+});
+// 转换为ImageCollection
+var annualMaxNDVIcol = ee.ImageCollection(annualMaxNDVI);
+
+// 5. 计算20年间NDVI的变化趋势
+var addTimeBand = function(image) {
+  var yearNum = ee.Number(image.get('year')).subtract(2001); // 转换为相对于2001的数值
+  return image.addBands(ee.Image(yearNum).rename('year').float())
+              .addBands(ee.Image.constant(1).rename('constant'));
+};
+var withTimeBands = annualMaxNDVIcol.map(addTimeBand);
+
+// 线性回归计算斜率
+var trend = withTimeBands.select(['year', 'constant', 'max_ndvi'])
+  .reduce(ee.Reducer.linearRegression(2, 1));
+var slope = trend.select('coefficients').arrayGet([0, 0]).rename('slope');
+
+// 6. 计算2001-2020年的平均NDVI和NDVI变化率
+var meanNDVI = annualMaxNDVIcol.mean().rename('mean_ndvi');
+var ndvi2001 = ee.Image(annualMaxNDVIcol.filter(ee.Filter.eq('year', 2001)).first());
+var ndvi2020 = ee.Image(annualMaxNDVIcol.filter(ee.Filter.eq('year', 2020)).first());
+var ndviChange = ndvi2020.subtract(ndvi2001).rename('ndvi_change');
+var ndviChangeRate = ndviChange.divide(20).rename('ndvi_change_rate');  // 年变化率
+
+// 7. 可视化参数设置
+var ndviPalette = ['red', 'white', 'green'];
+var slopePalette = ['blue', 'white','red'];
+
+// 8. 添加图层到地图并裁剪到宁夏边界
+Map.addLayer(ndvi2001.clip(ningxiaBounds), {min: 0, max: 0.8, palette: ndviPalette}, '2001年NDVI');
+Map.addLayer(ndvi2020.clip(ningxiaBounds), {min: 0, max: 0.8, palette: ndviPalette}, '2020年NDVI');
+Map.addLayer(ndviChange.clip(ningxiaBounds), {min: -0.5, max: 0.5, palette: ['brown', 'white', 'green']}, 'NDVI变化(2020-2001)');
+Map.addLayer(slope.clip(ningxiaBounds), {min: -0.03, max: 0.03, palette: slopePalette}, 'NDVI变化趋势斜率');
+
+// 9. 创建时间序列图表：宁夏全区平均NDVI年际变化
+var yearlyMeanNDVIData = years.map(function(year) {
+  var img = ee.Image(annualMaxNDVIcol.filter(ee.Filter.eq('year', year)).first());
+  var mean = img.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: ningxiaBounds,
+    scale: 500,
+    maxPixels: 1e9
+  });
+  mean = mean ? mean.get('max_ndvi') : null;
+  return ee.Feature(null, {
+    'year': year,
+   'mean_ndvi': mean
+  });
+});
+var chartData = ee.FeatureCollection(yearlyMeanNDVIData);
+var timeSeriesChart = ui.Chart.feature.byFeature(chartData, 'year','mean_ndvi')
+  .setChartType('LineChart')
+  .setOptions({
+    title: '宁夏2001-2020年平均NDVI时间序列',
+    vAxis: {title: '平均NDVI'},
+    hAxis: {title: '年份'},
+    lineWidth: 2,
+    pointSize: 4,
+    series: {0: {color: 'green'}}
+  });
+print('宁夏平均NDVI年际变化', timeSeriesChart);
+
+// 10. 计算不同植被覆盖等级的面积变化
+var ndviClasses = function(image) {
+  var bare = image.lte(0.1).rename('bare');
+  var low = image.gt(0.1).and(image.lte(0.3)).rename('low');
+  var medium = image.gt(0.3).and(image.lte(0.5)).rename('medium');
+  var high = image.gt(0.5).rename('high');
+  return ee.Image.cat([bare, low, medium, high]);
+};
+function calculateNDVIClassAreas(year) {
+  var ndviImage = ee.Image(annualMaxNDVIcol.filter(ee.Filter.eq('year', year)).first()).clip(ningxiaBounds);
+  var classes = ndviClasses(ndviImage).multiply(ee.Image.pixelArea());
+  var areas = classes.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: ningxiaBounds,
+    scale: 500,
+    maxPixels: 1e9
+  });
+  areas = areas ? areas : {};
+  return {
+    'bare': ee.Number(areas.get('bare') || 0).divide(10000),
+    'low': ee.Number(areas.get('low') || 0).divide(10000),
+   'medium': ee.Number(areas.get('medium') || 0).divide(10000),
+    'high': ee.Number(areas.get('high') || 0).divide(10000)
+  };
+}
+var area2001ha = calculateNDVIClassAreas(2001);
+var area2020ha = calculateNDVIClassAreas(2020);
+
+// 11. 创建面积变化图表
+var areaChartData = ee.FeatureCollection([
+  ee.Feature(null, {
+    'class': '裸地',
+    '2001': area2001ha.bare,
+    '2020': area2020ha.bare
+  }),
+  ee.Feature(null, {
+    'class': '低覆盖',
+    '2001': area2001ha.low,
+    '2020': area2020ha.low
+  }),
+  ee.Feature(null, {
+    'class': '中覆盖',
+    '2001': area2001ha.medium,
+    '2020': area2020ha.medium
+  }),
+  ee.Feature(null, {
+    'class': '高覆盖',
+    '2001': area2001ha.high,
+    '2020': area2020ha.high
+  })
+]);
+var areaChart = ui.Chart.feature.byFeature(areaChartData, 'class', ['2001', '2020'])
+  .setChartType('ColumnChart')
+  .setOptions({
+    title: '宁夏2001年与2020年各植被覆盖等级面积对比(公顷)',
+    vAxis: {title: '面积(公顷)'},
+    hAxis: {title: '植被覆盖等级'},
+    series: {
+      0: {color: 'brown', label: '2001年'},
+      1: {color: 'green', label: '2020年'}
+    }
+  });
+print(areaChart, '植被覆盖等级面积对比'); // 修正print参数顺序
+
+// 12. 导出结果
+Export.image.toDrive({
+  image: meanNDVI.clip(ningxiaBounds),
+  description: 'ningxia_mean_ndvi_2001-2020',
+  folder: 'GEE_exports',
+  scale: 500,
+  region: ningxiaBounds,
+  maxPixels: 1e13
+});
+Export.image.toDrive({
+  image: slope.clip(ningxiaBounds),
+  description: 'ningxia_ndvi_trend_2001-2020',
+  folder: 'GEE_exports',
+  scale: 500,
+  region: ningxiaBounds,
+  maxPixels: 1e13
+});
+// 13. 计算年度EVI最大值
+var years = ee.List.sequence(2001, 2020);
+
+var annualMaxEVI = years.map(function(year) {
+  var startDate = ee.Date.fromYMD(year, 1, 1);
+  var endDate = ee.Date.fromYMD(year, 12, 31);
+  return modisEVIscaled
+    .filterDate(startDate, endDate)
+    .max()
+    .set('year', year)
+    .rename('max_evi');
+});
+var annualMaxEVIcol = ee.ImageCollection(annualMaxEVI);
+
+// 14. 计算每年的EVI最大值的均值，方便生成图表
+var yearlyMeanEVI = years.map(function(year) {
+  var img = ee.Image(annualMaxEVIcol.filter(ee.Filter.eq('year', year)).first());
+  var mean = img.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: ningxiaBounds,
+    scale: 500,
+    maxPixels: 1e9
+  }).get('max_evi');
+  
+  return ee.Feature(null, {
+    'year': year,
+    'mean_evi': mean
+  });
+});
+
+// 将每年EVI的均值转换为FeatureCollection
+var chartData = ee.FeatureCollection(yearlyMeanEVI);
+
+// 15. 绘制EVI的时间序列图表（条形图）
+var eviChart = ui.Chart.feature.byFeature(chartData, 'year', 'mean_evi')
+  .setChartType('ColumnChart')
+  .setOptions({
+    title: '宁夏2001-2020年EVI年际变化',
+    vAxis: {title: 'EVI'},
+    hAxis: {title: '年份'},
+    lineWidth: 2,
+    pointSize: 4,
+    series: {0: {color: 'green'}}
+  });
+
+print('宁夏2001-2020年EVI年际变化', eviChart);
+
+// 16. 可视化：展示EVI最大值（2001和2020年）
+var eviPalette = ['blue', 'yellow', 'green'];
+
+// 2001年和2020年的EVI最大值
+Map.addLayer(ee.Image(annualMaxEVIcol.filter(ee.Filter.eq('year', 2001)).first()).clip(ningxiaBounds), 
+  {min: 0, max: 0.8, palette: eviPalette}, '2001年EVI');
+Map.addLayer(ee.Image(annualMaxEVIcol.filter(ee.Filter.eq('year', 2020)).first()).clip(ningxiaBounds), 
+  {min: 0, max: 0.8, palette: eviPalette}, '2020年EVI');
+
+// 17. 导出结果：导出EVI的最大值图像到Google Drive
+Export.image.toDrive({
+  image: annualMaxEVIcol.mean().clip(ningxiaBounds),
+  description: 'ningxia_max_evi_2001-2020',
+  folder: 'GEE_exports',
+  scale: 500,
+  region: ningxiaBounds,
+  maxPixels: 1e13
+});
+
+// 18. 计算湿度指数（简化湿度指数模型）
+var calculateWetnessIndex = function(image) {
+  var blue = image.select('sur_refl_b03').multiply(0.0001); // 蓝光波段
+  var green = image.select('sur_refl_b04').multiply(0.0001); // 绿光波段
+  var red = image.select('sur_refl_b01').multiply(0.0001);  // 红光波段
+  var nir = image.select('sur_refl_b02').multiply(0.0001);  // 近红外波段
+  var swir1 = image.select('sur_refl_b05').multiply(0.0001); // 短波红外1波段
+  var swir2 = image.select('sur_refl_b07').multiply(0.0001); // 短波红外2波段
+  
+  // 简化湿度指数（SWI）的计算公式
+  var wetness = image.expression(
+    '((0.1147 * red) + (0.2489 * nir) + (0.2408 * blue) + (0.3132 * green) - (0.3122 * swir1) - (0.6416 * swir2))',
+    { red: red, nir: nir, blue: blue, green: green, swir1: swir1, swir2: swir2 }
+  );
+  return image.addBands(wetness.rename('wetness'));
+};
+
+var modisWetness = modisReflectance.map(calculateWetnessIndex);
+
+// 19. 计算年度湿度指数（湿度指数最大值或均值）
+var years = ee.List.sequence(2001, 2020);
+
+var annualMaxWetness = years.map(function(year) {
+  var startDate = ee.Date.fromYMD(year, 1, 1);
+  var endDate = ee.Date.fromYMD(year, 12, 31);
+  
+  var maxWetness = modisWetness
+    .filterDate(startDate, endDate)
+    .max()
+    .set('year', year);
+  
+  // 选择湿度波段进行重命名
+  var wetnessBand = maxWetness.select('wetness').rename('max_wetness');
+  return wetnessBand.set('year', year);
+});
+var annualMaxWetnessCol = ee.ImageCollection(annualMaxWetness);
+
+// 20. 创建湿度指数时间序列图表（条形图）
+var yearlyMeanWetnessData = years.map(function(year) {
+  var img = ee.Image(annualMaxWetnessCol.filter(ee.Filter.eq('year', year)).first());
+  var mean = img.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: ningxiaBounds,
+    scale: 500,
+    maxPixels: 1e9
+  }).get('max_wetness');
+  
+  return ee.Feature(null, {
+    'year': year,
+    'mean_wetness': mean
+  });
+});
+
+// 将数据转换为FeatureCollection
+var chartData = ee.FeatureCollection(yearlyMeanWetnessData);
+
+// 创建湿度指数时间序列图表（条形图）
+var wetnessChart = ui.Chart.feature.byFeature(chartData, 'year', 'mean_wetness')
+  .setChartType('ColumnChart')
+  .setOptions({
+    title: '宁夏2001-2020年湿度指数年际变化',
+    vAxis: {title: '湿度指数'},
+    hAxis: {title: '年份'},
+    lineWidth: 2,
+    pointSize: 4,
+    series: {0: {color: 'blue'}}
+  });
+
+print('宁夏2001-2020年湿度指数年际变化', wetnessChart);
+
+
