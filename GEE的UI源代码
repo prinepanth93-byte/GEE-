@@ -1,0 +1,447 @@
+/***** GEE UI 脚本：带交互面板的 NDVI/EVI/湿度 指标分析 *****/
+/* ------------------ 1. 预置与全局变量 ------------------ */
+var ningxiaAssetId = "projects/ace-computer-472400-a2/assets/nningxialine"; // 用户提供的资产
+var defaultStart = '2001-01-01';
+var defaultEnd = '2020-12-31';
+var defaultScale = 500;
+
+/* 清空地图上的图层（可选）*/
+Map.clear();
+
+/* ------------------ 2. 构建 UI 控件 ------------------ */
+// 左侧主面板
+var mainPanel = ui.Panel({
+  style: {width: '360px', padding: '8px 12px'}
+});
+ui.root.insert(0, mainPanel);
+
+// 标题
+var title = ui.Label('NDVI / EVI / 湿度 指标交互式分析', {fontWeight: 'bold', fontSize: '18px', margin: '6px 0 12px 0'});
+mainPanel.add(title);
+
+// 区域选择
+mainPanel.add(ui.Label('1) 选择研究区：', {fontWeight: 'bold'}));
+var regionSelect = ui.Select({
+  items: ['宁夏（资产）', '自定义矩形（输入四点经纬度）'],
+  value: '宁夏（资产）',
+  style: {stretch: 'horizontal'}
+});
+mainPanel.add(regionSelect);
+
+// 自定义四点输入（lon1,lat1,...lon4,lat4）
+var coordsPanel = ui.Panel({
+  widgets: [
+    ui.Label('自定义矩形：按顺序输入四个点（经度, 纬度）', {fontSize: '12px'}),
+    ui.Textbox({placeholder: 'lon1,lat1 (例如: 104.0,35.0)', style: {stretch: 'horizontal'}}),
+    ui.Textbox({placeholder: 'lon2,lat2', style: {stretch: 'horizontal'}}),
+    ui.Textbox({placeholder: 'lon3,lat3', style: {stretch: 'horizontal'}}),
+    ui.Textbox({placeholder: 'lon4,lat4', style: {stretch: 'horizontal'}})
+  ],
+  style: {margin: '6px 0 12px 0'}
+});
+mainPanel.add(coordsPanel);
+coordsPanel.style().set('shown', false);
+
+// 日期范围输入
+mainPanel.add(ui.Label('2) 输入日期范围：', {fontWeight: 'bold'}));
+var startDateBox = ui.Textbox({value: defaultStart, placeholder: 'YYYY-MM-DD', style: {stretch: 'horizontal'}});
+var endDateBox = ui.Textbox({value: defaultEnd, placeholder: 'YYYY-MM-DD', style: {stretch: 'horizontal'}});
+mainPanel.add(ui.Label('开始日期'));
+mainPanel.add(startDateBox);
+mainPanel.add(ui.Label('结束日期'));
+mainPanel.add(endDateBox);
+
+// 年份选择器（用于植被等级比较的两个年份）
+mainPanel.add(ui.Label('3) 选择用于面积比较的两个年份：', {fontWeight: 'bold', margin: '8px 0 0 0'}));
+var yearSelectStart = ui.Select({items: [], style: {stretch: 'horizontal'}});
+var yearSelectEnd = ui.Select({items: [], style: {stretch: 'horizontal'}});
+mainPanel.add(yearSelectStart);
+mainPanel.add(yearSelectEnd);
+
+// 分辨率输入
+mainPanel.add(ui.Label('4) 输出分辨率（米）:'));
+var scaleBox = ui.Textbox({value: String(defaultScale), style: {stretch: 'horizontal'}});
+
+// 运行与导出按钮
+var runButton = ui.Button({label: '运行分析 (Run)', style: {stretch: 'horizontal', backgroundColor: '#27ae60', color: 'white'}});
+var exportMeanBtn = ui.Button({label: '导出：均值图像到 Drive', disabled: true});
+var exportTrendBtn = ui.Button({label: '导出：趋势图像到 Drive', disabled: true});
+mainPanel.add(scaleBox);
+mainPanel.add(runButton);
+mainPanel.add(exportMeanBtn);
+mainPanel.add(exportTrendBtn);
+
+// 状态信息与日志
+var statusBox = ui.Label('状态：等待运行。', {whiteSpace: 'pre'});
+mainPanel.add(ui.Label('运行日志：', {fontWeight: 'bold', margin: '8px 0 0 0'}));
+mainPanel.add(statusBox);
+
+// 结果面板（图表容器）
+var chartPanel = ui.Panel({layout: ui.Panel.Layout.flow('vertical'), style: {margin: '12px 0 0 0'}});
+mainPanel.add(chartPanel);
+
+/* ------------------ 3. 控件联动逻辑 ------------------ */
+regionSelect.onChange(function(val) {
+  if (val === '自定义矩形（输入四点经纬度）') {
+    coordsPanel.setVisible(true);
+  } else {
+    coordsPanel.setVisible(false);
+  }
+});
+
+// 填充年份下拉（将根据用户输入的时间范围刷新）
+function refreshYearSelectors(startY, endY) {
+  var years = [];
+  for (var y = startY; y <= endY; y++) years.push(String(y));
+  yearSelectStart.items().reset(years);
+  yearSelectEnd.items().reset(years);
+  yearSelectStart.setValue(String(startY));
+  yearSelectEnd.setValue(String(endY));
+}
+
+/* ------------------ 辅助函数 ------------------ */
+// 将自定义四点文本输入转换为多边形（矩形，按最小外包矩形处理）
+function parseCustomPolygon(textboxes) {
+  var coords = [];
+  for (var i=0;i<textboxes.length;i++){
+    var t = textboxes[i].getValue();
+    if (!t) continue;
+    var parts = t.split(',');
+    if (parts.length !== 2) return null;
+    var lon = parseFloat(parts[0].trim());
+    var lat = parseFloat(parts[1].trim());
+    if (isNaN(lon) || isNaN(lat)) return null;
+    coords.push([lon, lat]);
+  }
+  if (coords.length < 2) return null;
+  // 构建最小矩形（Envelope）
+  var feats = coords.map(function(c){ return ee.Feature(ee.Geometry.Point(c)); });
+  var fc = ee.FeatureCollection(feats);
+  var geom = fc.geometry().bounds();
+  return geom;
+}
+
+// 简单像素面积转公顷的函数（Number）
+function toHa(valueM2) {
+  return ee.Number(valueM2).divide(10000);
+}
+
+/* ------------------ 4. 主计算函数（在点击 Run 时触发） ------------------ */
+runButton.onClick(function() {
+  // 清理地图图层和图表
+  Map.layers().reset();
+  chartPanel.clear();
+  statusBox.setValue('状态：开始准备数据 ...');
+
+  // 读取并验证输入
+  var regionChoice = regionSelect.getValue();
+  var geom;
+  if (regionChoice === '宁夏（资产）') {
+    geom = ee.FeatureCollection(ningxiaAssetId).geometry();
+    statusBox.setValue('状态：使用资产作为研究区：' + ningxiaAssetId);
+  } else {
+    var parsed = parseCustomPolygon(coordsPanel.widgets());
+    if (!parsed) {
+      statusBox.setValue('错误：自定义坐标解析失败，请检查输入格式（经度,纬度）');
+      return;
+    }
+    geom = parsed;
+    statusBox.setValue('状态：使用自定义矩形作为研究区。');
+  }
+
+  // 读取并验证日期
+  var sDate = startDateBox.getValue();
+  var eDate = endDateBox.getValue();
+  try {
+    var sDateObj = ee.Date(sDate);
+    var eDateObj = ee.Date(eDate);
+  } catch (err) {
+    statusBox.setValue('错误：日期格式无效，请使用 YYYY-MM-DD');
+    return;
+  }
+
+  // 解析 scale
+  var scale = parseInt(scaleBox.getValue(), 10) || defaultScale;
+
+  // 计算年份范围并填充选择器
+  var startYear = Number(sDate.split('-')[0]);
+  var endYear = Number(eDate.split('-')[0]);
+  if (isNaN(startYear) || isNaN(endYear) || startYear > endYear) {
+    statusBox.setValue('错误：年份解析失败或起始年 > 终止年。');
+    return;
+  }
+  refreshYearSelectors(startYear, endYear);
+
+  // 显示研究区边界
+  Map.centerObject(geom, 7);
+  Map.addLayer(ee.FeatureCollection(ee.Feature(geom)), {color: 'yellow'}, '研究区边界');
+
+  // 加载 MODIS 数据（NDVI, EVI, 反射率）
+  statusBox.setValue('状态：加载 MODIS 数据并标准化...');
+  var modisNDVI = ee.ImageCollection('MODIS/006/MOD13A1')
+    .filterDate(sDate, eDate)
+    .filterBounds(geom)
+    .select('NDVI');
+
+  var modisEVI = ee.ImageCollection('MODIS/006/MOD13A1')
+    .filterDate(sDate, eDate)
+    .filterBounds(geom)
+    .select('EVI')
+    .map(function(img){ return img.multiply(0.0001).copyProperties(img, ['system:time_start']); });
+
+  var modisReflectance = ee.ImageCollection('MODIS/006/MOD09A1')
+    .filterDate(sDate, eDate)
+    .filterBounds(geom);
+
+  // 标准化 NDVI
+  var modisNDVIscaled = modisNDVI.map(function(image){ return image.divide(10000).copyProperties(image, ['system:time_start']); });
+
+  // 生成年度列表
+  var years = ee.List.sequence(startYear, endYear);
+
+  statusBox.setValue('状态：按年计算年度最大 NDVI / EVI / 湿度 ...');
+  // 年度最大 NDVI
+  var annualMaxNDVI = years.map(function(y){
+    var start = ee.Date.fromYMD(ee.Number(y).toInt(), 1, 1);
+    var end = ee.Date.fromYMD(ee.Number(y).toInt(), 12, 31);
+    return modisNDVIscaled.filterDate(start, end).max()
+      .set('year', y)
+      .set('system:time_start', start.millis())
+      .rename('max_ndvi');
+  });
+  var annualMaxNDVIcol = ee.ImageCollection(annualMaxNDVI);
+
+  // 年度最大 EVI
+  var annualMaxEVI = years.map(function(y){
+    var start = ee.Date.fromYMD(ee.Number(y).toInt(), 1, 1);
+    var end = ee.Date.fromYMD(ee.Number(y).toInt(), 12, 31);
+    return modisEVI.filterDate(start, end).max()
+      .set('year', y)
+      .rename('max_evi');
+  });
+  var annualMaxEVIcol = ee.ImageCollection(annualMaxEVI);
+
+  // 计算湿度指数（基于 MOD09A1 波段归一化系数）
+  var calculateWetnessIndex = function(image) {
+    var blue = image.select('sur_refl_b03').multiply(0.0001);
+    var green = image.select('sur_refl_b04').multiply(0.0001);
+    var red = image.select('sur_refl_b01').multiply(0.0001);
+    var nir = image.select('sur_refl_b02').multiply(0.0001);
+    var swir1 = image.select('sur_refl_b05').multiply(0.0001);
+    var swir2 = image.select('sur_refl_b07').multiply(0.0001);
+    var wetness = image.expression(
+      '((0.1147 * red) + (0.2489 * nir) + (0.2408 * blue) + (0.3132 * green) - (0.3122 * swir1) - (0.6416 * swir2))',
+      { red: red, nir: nir, blue: blue, green: green, swir1: swir1, swir2: swir2 }
+    );
+    return image.addBands(wetness.rename('wetness'));
+  };
+  var modisWetness = modisReflectance.map(calculateWetnessIndex);
+
+  var annualMaxWetness = years.map(function(y){
+    var start = ee.Date.fromYMD(ee.Number(y).toInt(), 1, 1);
+    var end = ee.Date.fromYMD(ee.Number(y).toInt(), 12, 31);
+    var maxWet = modisWetness.filterDate(start, end).max()
+      .set('year', y);
+    return maxWet.select('wetness').rename('max_wetness').set('year', y);
+  });
+  var annualMaxWetnessCol = ee.ImageCollection(annualMaxWetness);
+
+  /* 计算均值、差值、趋势（简化） */
+  statusBox.setValue('状态：计算均值与线性趋势...');
+  var meanNDVI = annualMaxNDVIcol.mean().rename('mean_ndvi');
+  var meanEVI = annualMaxEVIcol.mean().rename('mean_evi');
+  var meanWetness = annualMaxWetnessCol.mean().rename('mean_wetness');
+
+  // 为趋势计算添加时间带（以起始年为 0）
+  var addTimeBand = function(image) {
+    var yearNum = ee.Number(image.get('year')).subtract(startYear);
+    return image.addBands(ee.Image(yearNum).rename('year').float())
+                .addBands(ee.Image.constant(1).rename('constant'));
+  };
+  var withTimeBands = annualMaxNDVIcol.map(addTimeBand);
+  var trend = withTimeBands.select(['year','constant','max_ndvi']).reduce(ee.Reducer.linearRegression(2,1));
+  var slope = trend.select('coefficients').arrayGet([0,0]).rename('slope');
+
+  /* ------------------ 可视化与图表 ------------------ */
+  statusBox.setValue('状态：在 Map 上显示图层并生成图表...');
+  // 可视化参数
+  var ndviPalette = ['red','white','green'];
+  var eviPalette = ['blue','yellow','green'];
+  var slopePalette = ['blue','white','red'];
+
+  // 显示均值与趋势
+  Map.addLayer(meanNDVI.clip(geom), {min:0, max:0.8, palette: ndviPalette}, '平均 NDVI (' + sDate + ' ~ ' + eDate + ')');
+  Map.addLayer(meanEVI.clip(geom), {min:0, max:0.8, palette: eviPalette}, '平均 EVI (' + sDate + ' ~ ' + eDate + ')');
+  Map.addLayer(meanWetness.clip(geom), {min:-0.5, max:0.5, palette: ['brown','white','blue']}, '平均 湿度指数');
+  Map.addLayer(slope.clip(geom), {min:-0.03, max:0.03, palette: slopePalette}, 'NDVI 线性趋势斜率');
+
+  /* 年际时间序列（全区平均）*/
+  var yearlyMeanNDVIData = years.map(function(y){
+    var img = ee.Image(annualMaxNDVIcol.filter(ee.Filter.eq('year', y)).first());
+    var mean = img.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geom,
+      scale: scale,
+      maxPixels: 1e9
+    }).get('max_ndvi');
+    return ee.Feature(null, {'year': y, 'mean_ndvi': mean});
+  });
+  var ndviChartData = ee.FeatureCollection(yearlyMeanNDVIData);
+  var ndviChart = ui.Chart.feature.byFeature(ndviChartData, 'year', 'mean_ndvi')
+    .setChartType('LineChart')
+    .setOptions({
+      title: '年度平均 NDVI (' + startYear + '-' + endYear + ')',
+      vAxis: {title: '平均 NDVI'},
+      hAxis: {title: '年份'},
+      lineWidth: 2,
+      pointSize: 4
+    });
+  chartPanel.add(ui.Label('年度平均 NDVI 时间序列', {fontWeight: 'bold'}));
+  chartPanel.add(ndviChart);
+
+  // EVI 时间序列
+  var yearlyMeanEVIData = years.map(function(y){
+    var img = ee.Image(annualMaxEVIcol.filter(ee.Filter.eq('year', y)).first());
+    var mean = img.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geom,
+      scale: scale,
+      maxPixels: 1e9
+    }).get('max_evi');
+    return ee.Feature(null, {'year': y, 'mean_evi': mean});
+  });
+  var eviChartData = ee.FeatureCollection(yearlyMeanEVIData);
+  var eviChart = ui.Chart.feature.byFeature(eviChartData, 'year', 'mean_evi')
+    .setChartType('ColumnChart')
+    .setOptions({title: '年度平均 EVI', vAxis: {title: 'EVI'}, hAxis: {title: '年份'}});
+  chartPanel.add(ui.Label('年度平均 EVI 时间序列', {fontWeight: 'bold'}));
+  chartPanel.add(eviChart);
+
+  // 湿度时间序列
+  var yearlyMeanWetnessData = years.map(function(y){
+    var img = ee.Image(annualMaxWetnessCol.filter(ee.Filter.eq('year', y)).first());
+    var mean = img.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geom,
+      scale: scale,
+      maxPixels: 1e9
+    }).get('max_wetness');
+    return ee.Feature(null, {'year': y, 'mean_wetness': mean});
+  });
+  var wetChartData = ee.FeatureCollection(yearlyMeanWetnessData);
+  var wetChart = ui.Chart.feature.byFeature(wetChartData, 'year', 'mean_wetness')
+    .setChartType('ColumnChart')
+    .setOptions({title: '年度平均 湿度指数', vAxis: {title: '湿度指数'}, hAxis: {title: '年份'}});
+  chartPanel.add(ui.Label('年度平均 湿度指数 时间序列', {fontWeight: 'bold'}));
+  chartPanel.add(wetChart);
+
+  /* ------------------ 植被覆盖等级面积计算（用于两年对比） ------------------ */
+  function ndviClasses(image) {
+    var bare = image.lte(0.1).rename('bare');
+    var low = image.gt(0.1).and(image.lte(0.3)).rename('low');
+    var medium = image.gt(0.3).and(image.lte(0.5)).rename('medium');
+    var high = image.gt(0.5).rename('high');
+    return ee.Image.cat([bare, low, medium, high]);
+  }
+
+  var y1 = parseInt(yearSelectStart.getValue(), 10);
+  var y2 = parseInt(yearSelectEnd.getValue(), 10);
+  var img1 = ee.Image(annualMaxNDVIcol.filter(ee.Filter.eq('year', y1)).first()).clip(geom);
+  var img2 = ee.Image(annualMaxNDVIcol.filter(ee.Filter.eq('year', y2)).first()).clip(geom);
+
+  var classes1 = ndviClasses(img1).multiply(ee.Image.pixelArea());
+  var classes2 = ndviClasses(img2).multiply(ee.Image.pixelArea());
+
+  var areas1 = classes1.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geom,
+    scale: scale,
+    maxPixels: 1e12
+  });
+  var areas2 = classes2.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: geom,
+    scale: scale,
+    maxPixels: 1e12
+  });
+
+  // 将 m^2 转换为 ha（注意：ReduceRegion 返回的是客户端对象，需要 UI 显示时使用 .getInfo()）
+  var areaFeature = ee.Feature(null, {
+    'class': '比较',
+    'year1_bare': toHa(ee.Number(areas1.get('bare') || 0)),
+    'year1_low': toHa(ee.Number(areas1.get('low') || 0)),
+    'year1_medium': toHa(ee.Number(areas1.get('medium') || 0)),
+    'year1_high': toHa(ee.Number(areas1.get('high') || 0)),
+    'year2_bare': toHa(ee.Number(areas2.get('bare') || 0)),
+    'year2_low': toHa(ee.Number(areas2.get('low') || 0)),
+    'year2_medium': toHa(ee.Number(areas2.get('medium') || 0)),
+    'year2_high': toHa(ee.Number(areas2.get('high') || 0))
+  });
+
+  // 构造柱状图数据（在服务器端构造 FeatureCollection）
+  var areaChartFC = ee.FeatureCollection([
+    ee.Feature(null, {'class': '裸地', 'year1': areaFeature.get('year1_bare'), 'year2': areaFeature.get('year2_bare')}),
+    ee.Feature(null, {'class': '低覆盖', 'year1': areaFeature.get('year1_low'), 'year2': areaFeature.get('year2_low')}),
+    ee.Feature(null, {'class': '中覆盖', 'year1': areaFeature.get('year1_medium'), 'year2': areaFeature.get('year2_medium')}),
+    ee.Feature(null, {'class': '高覆盖', 'year1': areaFeature.get('year1_high'), 'year2': areaFeature.get('year2_high')})
+  ]);
+
+  var areaChart = ui.Chart.feature.byFeature(areaChartFC, 'class', ['year1','year2'])
+    .setChartType('ColumnChart')
+    .setOptions({
+      title: '植被覆盖等级面积对比 (单位：公顷) ' + y1 + ' vs ' + y2,
+      vAxis: {title: '面积 (公顷)'},
+      hAxis: {title: '植被等级'},
+      series: {0: {labelInLegend: String(y1)}, 1: {labelInLegend: String(y2)}}
+    });
+
+  chartPanel.add(ui.Label('植被覆盖等级面积对比', {fontWeight: 'bold', margin: '8px 0 0 0'}));
+  chartPanel.add(areaChart);
+
+  statusBox.setValue('状态：分析完成。你可以在地图上查看图层，或使用下方导出按钮导出图像。');
+  exportMeanBtn.setDisabled(false);
+  exportTrendBtn.setDisabled(false);
+
+  // 设置导出按钮功能（导出均值与趋势）
+  exportMeanBtn.onClick(function(){
+    Export.image.toDrive({
+      image: meanNDVI.clip(geom),
+      description: 'mean_ndvi_' + startYear + '_' + endYear,
+      folder: 'GEE_exports',
+      scale: scale,
+      region: geom,
+      maxPixels: 1e13
+    });
+    statusBox.setValue('状态：已触发导出均值任务（请检查 Tasks 面板）。');
+  });
+
+  exportTrendBtn.onClick(function(){
+    Export.image.toDrive({
+      image: slope.clip(geom),
+      description: 'ndvi_trend_slope_' + startYear + '_' + endYear,
+      folder: 'GEE_exports',
+      scale: scale,
+      region: geom,
+      maxPixels: 1e13
+    });
+    statusBox.setValue('状态：已触发导出趋势任务（请检查 Tasks 面板）。');
+  });
+
+}); // runButton.onClick end
+
+/* ------------------ 5. 初始界面设置 ------------------ */
+// 初始填充年份选择（基于默认日期）
+refreshYearSelectors(Number(defaultStart.split('-')[0]), Number(defaultEnd.split('-')[0]));
+
+// 展示提示说明
+var helpText = ui.Label(
+  '使用说明：\n' +
+  '1) 选择研究区（可用资产或自定义四点经纬度的矩形）。\n' +
+  '2) 输入日期范围（格式 YYYY-MM-DD）。\n' +
+  '3) 点击 Run 等待分析完成，结果会显示在地图和右侧图表面板。\n' +
+  '4) 导出按钮会在分析完成后启用，导出任务会发送到 GEE Tasks 面板。',
+  {fontSize: '12px', whiteSpace: 'pre-line', margin: '8px 0 0 0'}
+);
+mainPanel.add(helpText);
+
+
